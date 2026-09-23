@@ -121,7 +121,8 @@ def main() -> None:
                   motivo="; ".join(falhas)[:400], alvo=(alvo or "")[:200])
         T.negar(
             "ENTREGA FINAL BLOQUEADA.\n\n"
-            + "\n\n".join(f"✗ {f}" for f in falhas)
+            + "\n\n".join(f.strip() if f.lstrip().startswith("✗") or "\n" in f
+                            else f"✗ {f}" for f in falhas)
             + "\n\n"
             + ("Medidas que passaram:\n" + "\n".join(medidas) + "\n\n" if medidas else "")
             + "SE O QUE FALTA É A BANCADA HUMANA, entenda o que se espera de você:\n"
