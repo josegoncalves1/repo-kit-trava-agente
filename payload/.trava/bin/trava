@@ -1,0 +1,498 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+trava — CLI do TRAVA-KIT.
+
+  ./trava status                 o que está sendo imposto AGORA
+  ./trava doutor                 diagnóstico: a trava está viva ou é enfeite?
+  ./trava selo listar|emitir|conferir|revogar
+  ./trava bancada abrir|responder|fechar|status     ← o teste humano
+  ./trava fiscal --sessao <id>   checa executor ≠ fiscal
+  ./trava auditoria [--verificar] [-n N]
+  ./trava forense [--sessao <id>]
+  ./trava rollback --sessao <id> [--ate <NNNNN>]
+  ./trava imposicao on|off --motivo "..."           ← exige TTY (humano)
+  ./trava entregar               a porta única da entrega final
+  ./trava testar                 prova que as travas travam
+
+ESTE CLI NÃO É A TRAVA. Ele é conveniência. Quem trava é o hook, que roda mesmo
+que ninguém chame nada aqui. Os comandos que MUDAM o estado da imposição exigem
+terminal interativo — o agente não tem TTY, e é esse o ponto.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+RAIZ = Path(os.environ.get("CLAUDE_PROJECT_DIR") or Path(__file__).resolve().parents[2])
+os.environ.setdefault("CLAUDE_PROJECT_DIR", str(RAIZ))
+sys.path.insert(0, str(RAIZ / ".claude" / "hooks"))
+
+try:
+    import lib_trava as T
+except ImportError:
+    sys.exit(f"ERRO: não encontrei lib_trava.py em {RAIZ}/.claude/hooks/\n"
+             f"A instalação está incompleta. Rode o setup.sh de novo.")
+
+V, R, A, Z = "\033[32m", "\033[31m", "\033[33m", "\033[0m"
+if not sys.stdout.isatty():
+    V = R = A = Z = ""
+
+
+def exige_tty(acao: str) -> None:
+    """A fronteira humano/agente. O agente chama Bash sem TTY; uma pessoa no
+    terminal tem. Não é criptografia — é uma fronteira real e barata."""
+    if not sys.stdin.isatty():
+        sys.exit(f"{R}RECUSADO:{Z} '{acao}' exige terminal interativo.\n"
+                 f"Um agente não tem TTY — e é exatamente por isso que este comando o exige.\n"
+                 f"Se você é um humano: rode no seu terminal, não através do agente.\n"
+                 f"Se você é um agente: peça ao usuário. Não tente contornar.")
+
+
+# ═══════════════════════════════════════════════════════════════ status
+def cmd_status(args) -> int:
+    imp = T.estado_imposicao()
+    contrato = T.carregar_contrato()
+    travas = contrato.get("travas", [])
+    fp = T.fingerprint_produto()
+
+    print(f"\n{'═'*66}")
+    print(f"  TRAVA-KIT v{T.VERSAO_KIT}  ·  {RAIZ}")
+    print(f"{'═'*66}\n")
+
+    if imp.get("ativa"):
+        print(f"  IMPOSIÇÃO: {V}ATIVA{Z}")
+    else:
+        resta = int(imp.get("expira_em", 0)) - T.agora()
+        print(f"  IMPOSIÇÃO: {R}SUSPENSA{Z} — {imp.get('motivo','?')}")
+        print(f"             volta sozinha em {max(0, resta//60)} min "
+              f"(por={imp.get('por','?')})")
+
+    print(f"  PRODUTO:   {fp}  ({len(T.arquivos_de_produto())} arquivos)")
+
+    b = T.estado_bancada()
+    if not b:
+        print(f"  BANCADA:   {A}nunca aberta{Z} — nenhum humano usou isto ainda")
+    elif not b.get("fechada_em"):
+        print(f"  BANCADA:   {A}ABERTA{Z} há {(T.agora()-b['aberta_em'])//60} min "
+              f"— feche com './trava bancada fechar'")
+    else:
+        dur = b["fechada_em"] - b["aberta_em"]
+        fresca = b.get("fingerprint") == fp
+        print(f"  BANCADA:   {'✅' if fresca else '⚠️ '} sessão de {dur}s"
+              f"{'' if fresca else f' {R}— sobre código ANTIGO{Z}'}")
+
+    print(f"\n  ── TRAVAS DECLARADAS ({len(travas)}) ──")
+    if not travas:
+        print(f"  {R}NENHUMA.{Z} Os hooks rodam, mas o contrato não declara nada:")
+        print(f"  nada será bloqueado. 'Instalado' não é 'protegido'.")
+        print(f"  Edite .trava/contrato.json — receitas em docs/04-receitas.md")
+    for t in travas:
+        q = t.get("quando", {})
+        alvo = ", ".join(q.get("ferramentas", ["*"]))
+        cond = []
+        for nome in t.get("exige_selos", []):
+            ok, motivo = T.conferir_selo(nome)
+            cond.append(f"{V}✅{Z} {nome}" if ok else f"{R}🔒{Z} {motivo}")
+        print(f"  • {t.get('id')}  [{t.get('veredito','deny')}]  ← {alvo}"
+              + (f"  /{q['regex_alvo']}/" if q.get("regex_alvo") else ""))
+        for c in cond:
+            print(f"      {c}")
+
+    saida = contrato.get("saida_subagente", {})
+    if saida.get("exige_selos") or saida.get("exige_arquivos"):
+        print(f"\n  ── SAÍDA DE SUB-AGENTE ──")
+        print(f"  exige: {', '.join(saida.get('exige_selos', [])) or '—'}"
+              f"  (máx {saida.get('max_reentradas', 3)} reentradas)")
+
+    ent = contrato.get("entrega_final", {})
+    print(f"\n  ── ENTREGA FINAL ──")
+    print(f"  {'ATIVA' if ent.get('ativo', True) else 'desligada'}"
+          f" · exige bancada humana: {'sim' if ent.get('exige_bancada', True) else 'não'}"
+          f" · exige revisão de doc: {'sim' if ent.get('exige_revisao_doc', True) else 'não'}")
+
+    ok, msg, n = T.verificar_ledger()
+    print(f"\n  AUDITORIA: {V if ok else R}{msg}{Z}")
+    print(f"  Espelho legível: AUDITORIA.md\n")
+    return 0
+
+
+def cmd_doutor(args) -> int:
+    """Distingue 'instalado' de 'protegido'. São coisas diferentes."""
+    print("\n── DIAGNÓSTICO ──\n")
+    problemas = []
+
+    st = RAIZ / ".claude" / "settings.json"
+    if not st.exists():
+        problemas.append("não existe .claude/settings.json — NENHUM hook está registrado")
+    else:
+        try:
+            cfg = json.loads(st.read_text(encoding="utf-8"))
+            eventos = list(cfg.get("hooks", {}).keys())
+            print(f"  hooks registrados: {', '.join(eventos) if eventos else '(nenhum)'}")
+            if not eventos:
+                problemas.append("settings.json existe mas não tem a chave 'hooks': "
+                                 "os .py estão inertes")
+            for ev in ("PreToolUse", "Stop", "SubagentStop"):
+                if ev not in eventos:
+                    problemas.append(f"evento '{ev}' não registrado")
+        except Exception as e:  # noqa: BLE001
+            problemas.append(f"settings.json inválido: {e}")
+
+    n_travas = len(T.carregar_contrato().get("travas", []))
+    print(f"  travas no contrato: {n_travas}")
+    if n_travas == 0:
+        problemas.append("contrato sem travas: os hooks rodam e nada bloqueia")
+
+    led = T._p_ledger()
+    n = len(led.read_text(encoding='utf-8').splitlines()) if led.exists() else 0
+    print(f"  registros de auditoria: {n}")
+    if n == 0:
+        problemas.append("auditoria VAZIA — o hook provavelmente nunca rodou. "
+                         "Reinicie a sessão do agente (hooks são lidos na inicialização)")
+
+    ok, msg, _ = T.verificar_ledger()
+    print(f"  integridade da cadeia: {msg}")
+    if not ok:
+        problemas.append(f"cadeia de auditoria quebrada: {msg}")
+
+    if not T.imposicao_ativa():
+        problemas.append("a imposição está SUSPENSA agora")
+
+    print()
+    if problemas:
+        print(f"{R}  {len(problemas)} problema(s):{Z}")
+        for p in problemas:
+            print(f"    ✗ {p}")
+        print(f"\n  'Instalado' não é 'protegido'. Corrija antes de confiar.\n")
+        return 1
+    print(f"{V}  tudo em ordem — mas confirme com './trava testar'{Z}\n")
+    return 0
+
+
+# ═══════════════════════════════════════════════════════════════ selos
+def cmd_selo(args) -> int:
+    if args.acao == "listar":
+        verifs = T.carregar_contrato().get("verificacoes", {})
+        if not verifs:
+            print("nenhuma verificação definida em .trava/contrato.json")
+            return 0
+        for nome, spec in verifs.items():
+            ok, motivo = T.conferir_selo(nome)
+            print(f"  {'✅' if ok else '🔒'} {nome:<22} {motivo}")
+            print(f"     comando: {spec.get('comando')}")
+        return 0
+
+    if args.acao == "emitir":
+        spec = T.carregar_contrato().get("verificacoes", {}).get(args.nome, {})
+        comando = args.comando or spec.get("comando")
+        if not comando:
+            print(f"ERRO: selo '{args.nome}' não tem comando no contrato e nenhum "
+                  f"--comando foi passado.", file=sys.stderr)
+            return 2
+        print(f"Executando a verificação de '{args.nome}':\n  $ {comando}\n", flush=True)
+        ok, corpo = T.emitir_selo(args.nome, comando,
+                                  ttl=args.ttl if args.ttl is not None else int(spec.get("ttl", 1800)))
+        print(corpo.get("trecho_saida", "").rstrip())
+        if ok:
+            print(f"\n{V}✅ SELO EMITIDO{Z}: '{args.nome}' (rc=0). A trava que o exigia liberou.")
+            return 0
+        print(f"\n{R}❌ SELO NÃO EMITIDO{Z}: a verificação falhou (rc={corpo['rc']}).\n"
+              f"   A trava CONTINUA ativa — e corretamente: o estado não passa.\n"
+              f"   Não edite o selo à mão: a assinatura não vai bater.", file=sys.stderr)
+        return 1
+
+    if args.acao == "conferir":
+        ok, motivo = T.conferir_selo(args.nome, estrito=args.estrito)
+        print(motivo)
+        return 0 if ok else 1
+
+    if args.acao == "revogar":
+        print("revogado" if T.revogar_selo(args.nome) else "não existia")
+        return 0
+    return 2
+
+
+# ═══════════════════════════════════════════════════════════ BANCADA
+def cmd_bancada(args) -> int:
+    if args.acao == "status":
+        b = T.estado_bancada()
+        print(json.dumps(b, indent=2, ensure_ascii=False) if b else "nenhuma bancada aberta")
+        return 0
+
+    if args.acao == "abrir":
+        contrato = T.carregar_contrato()
+        roteiro = contrato.get("bancada", {}).get("roteiro", [])
+        alvo = args.alvo or contrato.get("bancada", {}).get("alvo", "o produto")
+        b = T.abrir_bancada(alvo, roteiro, por=args.por)
+        b["por_sessao"] = T.sessao_atual()
+        T._p_bancada().write_text(json.dumps(b, indent=2, ensure_ascii=False), encoding="utf-8")
+        form = RAIZ / ".trava" / "formularios" / "laudo-bancada.md"
+        destino = RAIZ / "output" / "LAUDO-BANCADA.md"
+        destino.parent.mkdir(parents=True, exist_ok=True)
+        if not destino.exists() and form.exists():
+            destino.write_text(form.read_text(encoding="utf-8"), encoding="utf-8")
+        print(f"""
+{'═'*66}
+  BANCADA ABERTA — agora é com você, não com a máquina.
+{'═'*66}
+
+  Alvo: {alvo}
+
+  Sente. Pegue o mouse e o teclado. Olhe para a tela. USE.
+  Não confira se "subiu". Use como se fosse a primeira vez e você
+  precisasse resolver alguma coisa ali.
+""")
+        for i, passo in enumerate(roteiro, 1):
+            print(f"    {i}. {passo}")
+        print(f"""
+  Enquanto usa, repare em: o que salta aos olhos nos primeiros 5s; o que
+  você tentou primeiro por instinto; onde hesitou; o que incomodou mesmo
+  sem saber explicar; se a sensação prometida está lá.
+
+  Anote em: {destino.relative_to(RAIZ)}
+  Quando terminar:  ./trava bancada fechar
+
+  Tempo mínimo de sessão: {contrato.get('bancada', {}).get('min_segundos', 180)}s.
+  Abaixo disso não é uso, é conferência de screenshot.
+""")
+        return 0
+
+    if args.acao == "fechar":
+        b = T.estado_bancada()
+        if not b:
+            print("nenhuma bancada aberta. Abra com: ./trava bancada abrir", file=sys.stderr)
+            return 1
+        if b.get("fechada_em"):
+            print("esta bancada já foi fechada.", file=sys.stderr)
+            return 1
+        b["fechada_em"] = T.agora()
+        b["fingerprint_final"] = T.fingerprint_produto()
+        T._p_bancada().write_text(json.dumps(b, indent=2, ensure_ascii=False), encoding="utf-8")
+        dur = b["fechada_em"] - b["aberta_em"]
+        minimo = T.carregar_contrato().get("bancada", {}).get("min_segundos", 180)
+        T.auditar(evento="bancada", decisao="fechada", trava=b.get("alvo", ""),
+                  motivo=f"duração {dur}s (mínimo {minimo}s)")
+        print(f"bancada fechada — sessão de uso: {dur}s"
+              + ("" if dur >= minimo else f"  {R}(abaixo do mínimo de {minimo}s){Z}"))
+        arq = RAIZ / "output" / "LAUDO-BANCADA.md"
+        print(f"\nAgora preencha o laudo: {arq.relative_to(RAIZ) if arq.exists() else 'output/LAUDO-BANCADA.md'}")
+        print(f"E confira com:  ./trava bancada verificar")
+        return 0
+
+    if args.acao == "verificar":
+        v = RAIZ / ".claude" / "hooks" / "verificar_bancada.py"
+        minimo = T.carregar_contrato().get("bancada", {}).get("min_segundos", 180)
+        return subprocess.run([sys.executable, str(v), "output/LAUDO-BANCADA.md",
+                               "--min-segundos", str(minimo)], cwd=str(RAIZ)).returncode
+    return 2
+
+
+# ═══════════════════════════════════════════════════════════ papéis
+def cmd_fiscal(args) -> int:
+    conflito = T.conflito_de_papel(args.sessao)
+    if conflito:
+        print(f"{R}CONFLITO DE PAPEL:{Z} {conflito}", file=sys.stderr)
+        T.auditar(evento="papel", decisao="conflito", trava=args.sessao, motivo=conflito)
+        return 1
+    print(f"{V}ok:{Z} a sessão '{args.sessao}' não escreveu produto — pode fiscalizar.")
+    return 0
+
+
+def cmd_papel(args) -> int:
+    T.registrar_papel(args.tipo, T.sessao_atual(), args.descricao or "")
+    print(f"papel registrado: {args.tipo}")
+    return 0
+
+
+# ═══════════════════════════════════════════════════ auditoria e forense
+def cmd_auditoria(args) -> int:
+    if args.verificar:
+        ok, msg, n = T.verificar_ledger()
+        print(f"{V if ok else R}{msg}{Z}")
+        if not ok:
+            print("\nA cadeia de auditoria foi quebrada. Isso não prova quem fez, mas\n"
+                  "prova QUE foi feito — que é o serviço que uma auditoria presta.")
+        return 0 if ok else 1
+    p = T._p_ledger()
+    if not p.exists():
+        print("auditoria vazia — o hook provavelmente nunca rodou (./trava doutor)")
+        return 0
+    linhas = p.read_text(encoding="utf-8").splitlines()[-args.n:]
+    for l in linhas:
+        try:
+            r = json.loads(l)
+        except Exception:  # noqa: BLE001
+            continue
+        d = r.get("decisao", "")
+        cor = R if d in ("deny", "bloqueado", "SUSPENSA", "conflito") else (
+              A if d in ("ask", "cedido", "invalida") else V)
+        print(f"  {r.get('iso','')}  {cor}{d:<12}{Z} {r.get('evento',''):<16} "
+              f"{(r.get('trava') or r.get('ferramenta') or '')[:24]:<24} "
+              f"{(r.get('motivo') or '')[:70]}")
+    return 0
+
+
+def cmd_forense(args) -> int:
+    eventos = T.listar_forense(args.sessao)
+    if not eventos:
+        print("nenhum evento forense registrado")
+        return 0
+    for e in eventos:
+        print(f"  {e['id']}  {e.get('iso','')}  {e.get('ferramenta',''):<8} "
+              f"{'[snapshot]' if e.get('antes') else '[sem snapshot]':<16} {e.get('caminho','')}")
+    print(f"\n  {len(eventos)} evento(s). Rollback: ./trava rollback --sessao <id>")
+    return 0
+
+
+def cmd_rollback(args) -> int:
+    exige_tty("rollback")
+    eventos = [e for e in T.listar_forense(args.sessao) if e.get("antes")]
+    if args.ate:
+        eventos = [e for e in eventos if e["id"] >= args.ate]
+    if not eventos:
+        print("nada a restaurar")
+        return 0
+    print(f"\nSerão RESTAURADOS {len(eventos)} arquivo(s) ao estado anterior:")
+    for e in eventos[:20]:
+        print(f"  {e['id']}  {e['caminho']}")
+    if len(eventos) > 20:
+        print(f"  … e mais {len(eventos)-20}")
+    if input("\nDigite RESTAURAR para confirmar: ").strip() != "RESTAURAR":
+        print("cancelado")
+        return 1
+    for f in T.rollback(args.sessao, args.ate):
+        print(f"  restaurado: {f}")
+    return 0
+
+
+# ═══════════════════════════════════════════════════════════ imposição
+def cmd_imposicao(args) -> int:
+    if args.acao == "status":
+        print(json.dumps(T.estado_imposicao(), indent=2, ensure_ascii=False))
+        return 0
+    exige_tty(f"imposicao {args.acao}")
+    if args.acao == "on":
+        T.definir_imposicao(True, args.motivo or "reativada pelo humano")
+        print(f"{V}IMPOSIÇÃO ATIVA.{Z} Nenhuma entrega passa sem bancada humana.")
+        return 0
+    if len(args.motivo or "") < 10:
+        print("ERRO: suspender a imposição exige --motivo com pelo menos 10 caracteres.\n"
+              "O motivo vai para AUDITORIA.md e fica visível. É assim que se percebe,\n"
+              "semanas depois, que o modo de escape virou o modo padrão.", file=sys.stderr)
+        return 2
+    d = T.definir_imposicao(False, args.motivo, minutos=args.minutos)
+    print(f"{A}IMPOSIÇÃO SUSPENSA{Z} por {args.minutos} min — {args.motivo}\n"
+          f"Volta sozinha às {T.iso(d['expira_em'])}. Registrado em AUDITORIA.md.")
+    return 0
+
+
+# ═══════════════════════════════════════════════════════════ entrega
+def cmd_entregar(args) -> int:
+    """A porta única. Mesmo sem hooks, este caminho verifica."""
+    print("\n── ENTREGA FINAL ──\n")
+    contrato = T.carregar_contrato()
+    ent = contrato.get("entrega_final", {})
+    falhas = []
+
+    for nome in ent.get("exige_selos", []):
+        ok, motivo = T.conferir_selo(nome, estrito=True)
+        print(f"  {'✅' if ok else '❌'} selo {nome}: {motivo}")
+        if not ok:
+            falhas.append(motivo)
+
+    if ent.get("exige_bancada", True):
+        v = RAIZ / ".claude" / "hooks" / "verificar_bancada.py"
+        r = subprocess.run([sys.executable, str(v), "output/LAUDO-BANCADA.md",
+                            "--min-segundos",
+                            str(contrato.get("bancada", {}).get("min_segundos", 180))],
+                           cwd=str(RAIZ), capture_output=True, text=True)
+        print((r.stdout or r.stderr).rstrip())
+        if r.returncode != 0:
+            falhas.append("bancada humana não validada")
+
+    if ent.get("exige_revisao_doc", True):
+        v = RAIZ / ".claude" / "hooks" / "verificar_doc.py"
+        if v.exists():
+            r = subprocess.run([sys.executable, str(v)], cwd=str(RAIZ),
+                               capture_output=True, text=True)
+            print((r.stdout or r.stderr).rstrip())
+            if r.returncode != 0:
+                falhas.append("documentação não revisada junto com a entrega")
+
+    if falhas:
+        print(f"\n{R}ENTREGA BLOQUEADA{Z} — {len(falhas)} pendência(s).")
+        T.auditar(evento="entrega", decisao="bloqueada", motivo="; ".join(falhas)[:300])
+        return 1
+
+    print(f"\n{V}Checagens mecânicas: OK.{Z}")
+    print("O que a máquina NÃO julga — e por isso é com você:")
+    print("  • as cores são confortáveis numa sessão longa, ou só passam no contraste?")
+    print("  • os botões fazem sentido ONDE estão, ou só funcionam?")
+    print("  • o conjunto tem propósito, ou é código junto com propósitos desconexos?")
+    print("  • a sensação está lá? a areia esparrama, ou pisca?")
+    exige_tty("entregar")
+    if input("\nDigite ENTREGAR para confirmar: ").strip() != "ENTREGAR":
+        print("cancelado")
+        return 1
+    T.auditar(evento="entrega", decisao="liberada", motivo=f"fingerprint={T.fingerprint_produto()}")
+    print(f"{V}Entrega liberada e registrada.{Z}")
+    return 0
+
+
+def cmd_testar(args) -> int:
+    s = RAIZ / ".trava" / "bin" / "testar_travas.sh"
+    if not s.exists():
+        print(f"não encontrei {s}", file=sys.stderr)
+        return 1
+    return subprocess.run(["bash", str(s), str(RAIZ)]).returncode
+
+
+# ═══════════════════════════════════════════════════════════════ main
+def main() -> int:
+    ap = argparse.ArgumentParser(prog="trava", description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd")
+
+    sub.add_parser("status").set_defaults(fn=cmd_status)
+    sub.add_parser("doutor").set_defaults(fn=cmd_doutor)
+    sub.add_parser("entregar").set_defaults(fn=cmd_entregar)
+    sub.add_parser("testar").set_defaults(fn=cmd_testar)
+
+    s = sub.add_parser("selo"); s.add_argument("acao", choices=["listar","emitir","conferir","revogar"])
+    s.add_argument("nome", nargs="?"); s.add_argument("--comando"); s.add_argument("--ttl", type=int)
+    s.add_argument("--estrito", action="store_true"); s.set_defaults(fn=cmd_selo)
+
+    b = sub.add_parser("bancada")
+    b.add_argument("acao", choices=["abrir","fechar","status","verificar"])
+    b.add_argument("--alvo"); b.add_argument("--por", default="humano"); b.set_defaults(fn=cmd_bancada)
+
+    f = sub.add_parser("fiscal"); f.add_argument("--sessao", required=True); f.set_defaults(fn=cmd_fiscal)
+    pp = sub.add_parser("papel"); pp.add_argument("tipo"); pp.add_argument("--descricao")
+    pp.set_defaults(fn=cmd_papel)
+
+    au = sub.add_parser("auditoria"); au.add_argument("--verificar", action="store_true")
+    au.add_argument("-n", type=int, default=30); au.set_defaults(fn=cmd_auditoria)
+
+    fo = sub.add_parser("forense"); fo.add_argument("--sessao"); fo.set_defaults(fn=cmd_forense)
+    rb = sub.add_parser("rollback"); rb.add_argument("--sessao", required=True)
+    rb.add_argument("--ate"); rb.set_defaults(fn=cmd_rollback)
+
+    im = sub.add_parser("imposicao"); im.add_argument("acao", choices=["on","off","status"])
+    im.add_argument("--motivo", default=""); im.add_argument("--minutos", type=int, default=60)
+    im.set_defaults(fn=cmd_imposicao)
+
+    args = ap.parse_args()
+    if not getattr(args, "fn", None):
+        ap.print_help()
+        return 0
+    return args.fn(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

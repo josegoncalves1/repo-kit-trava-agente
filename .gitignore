@@ -1,0 +1,9 @@
+# estado de teste, nunca versionado
+.trava/chave.secreta
+.trava/selos/
+.trava/contadores/
+.trava/forense/
+.trava/bancada/
+evidencias/
+__pycache__/
+*.pyc

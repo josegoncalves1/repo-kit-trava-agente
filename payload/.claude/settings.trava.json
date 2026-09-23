@@ -1,0 +1,106 @@
+{
+  "_comentario": "FRAGMENTO. O setup.sh FUNDE isto no .claude/settings.json do projeto, preservando o que já existe e fazendo backup datado. Nunca substitua o arquivo inteiro à mão. Depois de instalar: REINICIE a sessão — hooks são capturados na inicialização.",
+
+  "permissions": {
+    "_comentario_deny": "CAMADA N4 — impossibilidade estrutural. O harness recusa ANTES de qualquer hook rodar. É a única camada que resiste a um agente adversário, porque não depende de o seu código funcionar.",
+    "deny": [
+      "Read(./.trava/chave.secreta)",
+      "Edit(./.claude/hooks/**)",
+      "Write(./.claude/hooks/**)",
+      "Edit(./.claude/settings.json)",
+      "Write(./.claude/settings.json)",
+      "Edit(./.claude/settings.local.json)",
+      "Write(./.claude/settings.local.json)",
+      "Edit(./.claude/agents/**)",
+      "Write(./.claude/agents/**)",
+      "Edit(./.trava/**)",
+      "Write(./.trava/**)",
+      "Read(./.env)",
+      "Read(./.env.*)",
+      "Read(./**/id_rsa)",
+      "Read(./**/*.pem)"
+    ],
+    "_comentario_autoprotecao": "As regras de .claude/ e .trava/ são a AUTOPROTEÇÃO. Sem elas, toda a camada de hooks é auto-editável. Elas NÃO cobrem Bash(cat > ...) — esse buraco é fechado pelo trava_gate.py (autoproteção em código) e, definitivamente, por montar .claude como somente-leitura num container.",
+
+    "ask": [
+      "Bash(git push:*)",
+      "Bash(npm publish:*)",
+      "Bash(docker push:*)",
+      "Bash(gh release create:*)"
+    ]
+  },
+
+  "hooks": {
+    "SessionStart": [
+      {
+        "_comentario": "O agente começa sabendo que está travado e o que falta. Economiza um ciclo inteiro por sessão.",
+        "matcher": "startup|resume|clear|compact",
+        "hooks": [
+          { "type": "command", "command": "python3 \"$CLAUDE_PROJECT_DIR/.claude/hooks/trava_sessao.py\"", "timeout": 15 }
+        ]
+      }
+    ],
+
+    "UserPromptSubmit": [
+      {
+        "_comentario": "Canal do humano (#trava-off / #trava-on) e republicação do contrato vivo a cada turno, lido do disco. Derrota a evaporação de contexto.",
+        "hooks": [
+          { "type": "command", "command": "python3 \"$CLAUDE_PROJECT_DIR/.claude/hooks/trava_prompt.py\"", "timeout": 15 }
+        ]
+      }
+    ],
+
+    "PreToolUse": [
+      {
+        "_comentario": "O gate principal: autoproteção, forense, papéis e o contrato. O matcher é regex SENSÍVEL A MAIÚSCULAS sobre o nome da ferramenta.",
+        "matcher": "Bash|Write|Edit|MultiEdit|NotebookEdit|Task|Read|WebFetch|WebSearch",
+        "hooks": [
+          { "type": "command", "command": "python3 \"$CLAUDE_PROJECT_DIR/.claude/hooks/trava_gate.py\"", "timeout": 20 }
+        ]
+      },
+      {
+        "_comentario": "A trava de entrega final, em três estágios: mecânico (deny) → bancada humana (deny) → ASK ao usuário. timeout alto: ela roda verificadores de verdade.",
+        "matcher": "Bash|Task",
+        "hooks": [
+          { "type": "command", "command": "python3 \"$CLAUDE_PROJECT_DIR/.claude/hooks/trava_entrega.py\"", "timeout": 130 }
+        ]
+      }
+    ],
+
+    "PostToolUse": [
+      {
+        "_comentario": "Invalida provas voláteis (mexeu no código, o selo de teste morreu) e roda checagem imediata sobre o arquivo escrito.",
+        "matcher": "Write|Edit|MultiEdit|NotebookEdit|Bash",
+        "hooks": [
+          { "type": "command", "command": "python3 \"$CLAUDE_PROJECT_DIR/.claude/hooks/trava_pos.py\"", "timeout": 30 }
+        ]
+      }
+    ],
+
+    "SubagentStop": [
+      {
+        "_comentario": "SEM matcher — eventos de Stop não têm nome de ferramenta. O sub-agente não encerra sem prova.",
+        "hooks": [
+          { "type": "command", "command": "python3 \"$CLAUDE_PROJECT_DIR/.claude/hooks/trava_stop.py\"", "timeout": 30 }
+        ]
+      }
+    ],
+
+    "Stop": [
+      {
+        "_comentario": "Mesmo script; lê 'saida_principal' do contrato. Mantenha exigências MÍNIMAS aqui: bloquear o turno principal impede o agente de responder ao usuário.",
+        "hooks": [
+          { "type": "command", "command": "python3 \"$CLAUDE_PROJECT_DIR/.claude/hooks/trava_stop.py\"", "timeout": 30 }
+        ]
+      }
+    ],
+
+    "SessionEnd": [
+      {
+        "hooks": [
+          { "type": "command", "command": "python3 \"$CLAUDE_PROJECT_DIR/.claude/hooks/trava_sessao.py\"", "timeout": 15 }
+        ]
+      }
+    ]
+  }
+}

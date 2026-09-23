@@ -1,0 +1,164 @@
+{
+  "versao": 1,
+  "_comentario": "Contrato COMPLETO de exemplo. O setup.sh gera um contrato MÍNIMO adaptado ao seu projeto; este aqui mostra tudo que é possível declarar. Este arquivo é a DECLARAÇÃO das travas — os hooks apenas o interpretam. Alterar aqui muda o comportamento sem tocar em código.",
+
+  "produto": {
+    "_comentario": "O que conta como 'código de produto' para o fingerprint e para o frescor das provas. Erre aqui e a trava vira loop: NUNCA inclua nada gerado (dist/, build/, *.map, lockfile).",
+    "extensoes": [".ts", ".tsx", ".js", ".jsx", ".vue", ".svelte", ".css", ".scss", ".html", ".py", ".go", ".rs", ".gd", ".shader", ".glsl"],
+    "ignorar": ["dist", "build", "node_modules", ".next", "coverage", "__pycache__"]
+  },
+
+  "verificacoes": {
+    "_comentario": "Cada entrada define COMO um selo é conquistado. './trava selo emitir <nome>' roda este comando; o selo só nasce se o código de saída for 0. Declarar não emite selo. Rodar emite.",
+    "testes-verdes": { "comando": "npm test --silent", "ttl": 1800, "descricao": "Suíte de testes passa inteira." },
+    "lint-limpo": { "comando": "npm run lint --silent", "ttl": 1800, "descricao": "Sem violações de lint." },
+    "plano-aprovado": { "comando": "test -s docs/PLANO.md && grep -q '^## APROVADO POR:' docs/PLANO.md", "ttl": 86400, "descricao": "Existe plano com aprovação explícita do usuário." },
+    "relatorio": { "comando": "test -s output/relatorio.md && [ $(wc -c < output/relatorio.md) -ge 300 ]", "ttl": 0, "descricao": "Relatório de entrega do sub-agente, com conteúdo mínimo." },
+    "revisao-cruzada": { "comando": "python3 .claude/hooks/verificar_revisao.py output/REVISAO.md . --min-refs 2", "ttl": 3600, "descricao": "Revisão do FISCAL, fresca, com lastro em arquivo:linha reais." },
+    "doc-revisada": { "comando": "python3 .claude/hooks/verificar_doc.py", "ttl": 3600, "descricao": "Documentação viva é mais nova que o código." },
+    "arvore-limpa": { "comando": "test -z \"$(git status --porcelain)\"", "ttl": 300, "descricao": "Nada não-commitado pendente." }
+  },
+
+  "perfis": {
+    "_comentario": "SEPARAÇÃO DE PAPÉIS. O fiscal não escreve código; o executor não escreve o laudo que o julga. Isto é reforçado pelo gate, e pelo toolset do agente (.claude/agents/*.md), que é a camada N4 e a mais forte.",
+    "trava-fiscal": {
+      "proibido_escrever": ["\\.(ts|tsx|js|jsx|vue|svelte|py|go|rs|css|scss|html|gd|shader)$"],
+      "mensagem": "Você é FISCAL. Fiscal não conserta: fiscal aponta. Se você corrigir o código, passa a ser executor do próprio laudo — e o laudo perde todo o valor."
+    },
+    "trava-executor": {
+      "proibido_escrever": ["output/REVISAO\\.md$", "output/LAUDO-BANCADA\\.md$"],
+      "mensagem": "Você é EXECUTOR. Você não escreve a revisão nem o laudo da bancada: quem construiu não julga. Escreva output/relatorio.md com o que fez e o que ficou pendente."
+    },
+    "trava-operador": {
+      "proibido_escrever": ["\\.(ts|tsx|js|jsx|vue|svelte|py|go|rs|css|scss|html|gd|shader)$"],
+      "mensagem": "Você é OPERADOR. Você opera o produto e descreve o que observa. Não conserta o que encontrar — relata."
+    }
+  },
+
+  "travas": [
+    {
+      "id": "sem-codigo-sem-plano",
+      "quando": { "ferramentas": ["Write", "Edit", "MultiEdit", "NotebookEdit"], "regex_excecao": "^(docs/|output/|README)" },
+      "exige_selos": ["plano-aprovado"],
+      "veredito": "deny",
+      "como_destravar": [
+        "# 1. escreva o plano em docs/PLANO.md",
+        "# 2. apresente ao usuário e obtenha aprovação explícita",
+        "# 3. adicione a linha '## APROVADO POR: <usuário>' em docs/PLANO.md",
+        "./trava selo emitir plano-aprovado"
+      ],
+      "mensagem": "Fase de planejamento: escrever código ainda não está liberado. Documentação (docs/, output/) continua permitida — senão você não consegue escrever o plano que destrava."
+    },
+    {
+      "id": "sem-push-sem-verde",
+      "quando": { "ferramentas": ["Bash"], "regex_alvo": "git\\s+(push|commit)" },
+      "exige_selos": ["testes-verdes", "lint-limpo"],
+      "estrito": true,
+      "veredito": "deny",
+      "como_destravar": ["./trava selo emitir testes-verdes", "./trava selo emitir lint-limpo"],
+      "mensagem": "Modo ESTRITO: os comandos de verificação são RE-EXECUTADOS neste instante. Um selo antigo não serve — se o código mudou, rode de novo."
+    },
+    {
+      "id": "subagente-nasce-com-contrato",
+      "quando": { "ferramentas": ["Task"] },
+      "exige_trecho_no_alvo": ["## CONTRATO DE EXECUÇÃO"],
+      "veredito": "deny",
+      "como_destravar": ["cat .trava/bloco-contrato.md   # copie este bloco", "# cole no INÍCIO do prompt do sub-agente e chame Task de novo"],
+      "mensagem": "O sub-agente nasce sem a sua conversa. Se o prompt dele não trouxer o contrato, ele vai bater nas travas sem saber como destravar e entrar em loop de tentativa."
+    },
+    {
+      "id": "orcamento-de-subagentes",
+      "quando": { "ferramentas": ["Task"] },
+      "orcamento": { "max": 4 },
+      "veredito": "ask",
+      "mensagem": "Já foram disparados 4 sub-agentes. Não é erro, é limite de custo: confirme antes de continuar o fan-out."
+    },
+    {
+      "id": "confirmar-destrutivo",
+      "quando": { "ferramentas": ["Bash"], "regex_alvo": "\\b(rm\\s+-rf|drop\\s+(table|database)|truncate|git\\s+reset\\s+--hard|git\\s+clean\\s+-fd|mkfs\\.|dd\\s+of=/dev/)|docker[\\s-]+compose\\s+(down|rm)[^|;&]*(-v\\b|--volumes)|docker\\s+volume\\s+(rm|prune)|docker\\s+system\\s+prune[^|;&]*--volumes" },
+      "veredito": "ask",
+      "mensagem": "Ação destrutiva e IRREVERSÍVEL. Se for docker: 'down -v', 'volume rm' e 'system prune --volumes' APAGAM OS DADOS dos volumes — para só parar containers use 'docker compose down' sem -v. Liste ao usuário exatamente o que será perdido antes de ele aprovar."
+    },
+    {
+      "id": "sem-rede-em-bypass",
+      "quando": { "ferramentas": ["WebFetch", "WebSearch"], "permission_modes": ["bypassPermissions"] },
+      "veredito": "deny",
+      "mensagem": "Em bypassPermissions não há confirmação humana; saída para a rede fica bloqueada nesta sessão. Peça ao usuário para rodar em modo default se precisar.",
+      "_nota": "Trava incondicional: casar com 'quando' já é a condição."
+    }
+  ],
+
+  "bancada": {
+    "_comentario": "O TESTE HUMANO. Não é automatizável e não deve ser. Aqui só se declara o alvo, o roteiro do que pedir à pessoa, e o tempo mínimo de sessão.",
+    "alvo": "a interface do produto, no navegador, como um usuário a usaria",
+    "min_segundos": 180,
+    "roteiro": [
+      "Abra o produto como se fosse a primeira vez. Não leia documentação antes.",
+      "Nos primeiros 5 segundos: o que saltou aos olhos? Anote ANTES de explorar.",
+      "Tente realizar a tarefa principal sem que ninguém explique nada.",
+      "Clique em cada botão visível. Ele faz o que o nome promete? Deveria estar ali?",
+      "Force o erro: envie vazio, envie lixo, desconecte a rede, recarregue no meio.",
+      "Passe 30s parado olhando a tela. Cansa? Alguma coisa vibra, aperta ou grita?",
+      "Se o produto promete uma sensação (movimento, peso, velocidade, resposta): ela está lá?"
+    ]
+  },
+
+  "documentacao": {
+    "_comentario": "Docs 'vivos' são revisados JUNTO com a entrega. Se o código mudou depois do doc, o doc descreve outra coisa.",
+    "vivos": ["README.md", "docs/"],
+    "min_bytes": 400
+  },
+
+  "entrega_final": {
+    "ativo": true,
+    "exige_selos": ["testes-verdes", "revisao-cruzada"],
+    "exige_bancada": true,
+    "exige_revisao_doc": true,
+    "exige_evidencia_visual": true,
+    "exige_movimento": false,
+    "min_contraste": 4.5,
+    "dossie": "output/LAUDO-BANCADA.md",
+    "midia": "evidencias",
+    "timeout": 110
+  },
+
+  "saida_subagente": {
+    "exige_selos": ["relatorio"],
+    "exige_arquivos": [{ "caminho": "output/relatorio.md", "min_bytes": 300 }],
+    "max_reentradas": 3,
+    "como_destravar": {
+      "relatorio": "escreva output/relatorio.md (o que fez, o que verificou, o que ficou pendente) e rode: ./trava selo emitir relatorio"
+    },
+    "saida_honrosa": "Se a tarefa for IMPOSSÍVEL de concluir, isso também é entrega válida: escreva em output/relatorio.md o que tentou, o erro literal que recebeu e o que precisaria para destravar; emita o selo 'relatorio'; então encerre. Não invente resultado, não contorne a trava, não edite os hooks."
+  },
+
+  "saida_por_papel": {
+    "_comentario": "Exigências diferentes por papel. O fiscal não encerra sem laudo; o executor não encerra sem relatório.",
+    "trava-fiscal": {
+      "exige_arquivos": [{ "caminho": "output/REVISAO.md", "min_bytes": 400 }],
+      "exige_selos": ["revisao-cruzada"],
+      "max_reentradas": 3,
+      "como_destravar": { "revisao-cruzada": "escreva output/REVISAO.md com '## VEREDITO: APROVADO|REPROVADO', seções obrigatórias e ao menos 2 referências arquivo:linha REAIS; depois: ./trava selo emitir revisao-cruzada" },
+      "saida_honrosa": "REPROVADO é um veredito válido e bom. Se o trabalho não está bom, diga isso com lastro e encerre — não conserte."
+    }
+  },
+
+  "saida_principal": {
+    "_comentario": "Stop do agente principal. Deixe MÍNIMO: bloquear o turno principal impede o agente de responder ao usuário. Ative 'exige_bancada' só se este projeto for de interface e você quiser a cobrança no fim de todo turno.",
+    "exige_selos": [],
+    "max_reentradas": 1
+  },
+
+  "loop": {
+    "_comentario": "Teto global de rodadas executor↔fiscal. Sem isto os dois jogam ping-pong até o limite de tokens.",
+    "max_rodadas": 6
+  },
+
+  "pos_acao": {
+    "selos_volateis": ["testes-verdes", "lint-limpo", "arvore-limpa", "revisao-cruzada", "doc-revisada"],
+    "checagens": [
+      { "id": "sintaxe-python", "sufixos": [".py"], "comando": "python3 -m py_compile \"{arquivo}\"", "timeout": 20 },
+      { "id": "json-valido", "sufixos": [".json"], "comando": "python3 -m json.tool \"{arquivo}\" > /dev/null", "timeout": 10 }
+    ]
+  }
+}
